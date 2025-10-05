@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 mode = "offline"   # "offline" or "online"
 folder_path = r"C:\Users\hackaton\Documents\gtec\Unicorn Suite\Hybrid Black\Unicorn Recorder"
 offline_file_path = r"olddata\UnicornRawDataRecorder_03_05_2025_20_13_360.csv"  # set to a specific CSV path or leave None to use newest in folder
+image_output_path = "outputs"  # If None, will save next to CSV in offline mode
 
 fs = 250           # Sampling rate (Hz)
 lowcut = 0.1
@@ -281,7 +282,8 @@ def run_offline():
 
     # Save plot next to CSV
     base = os.path.splitext(os.path.basename(file_path))[0]
-    out_png = os.path.join(os.path.dirname(file_path), f"{base}_focus_timeseries.png")
+    base = base.replace("UnicornRawDataRecorder_", "")
+    out_png = os.path.join(os.path.dirname(image_output_path), f"{base}_focus_timeseries.png")
     save_focus_plot(time_centers, binary, out_png)
 
     # Console summary
