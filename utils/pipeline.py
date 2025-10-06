@@ -6,13 +6,34 @@ from scipy.signal import butter, filtfilt, welch
 import os
 import glob
 import matplotlib.pyplot as plt
+from collections import deque
 
 # ========================
 # CONFIG
 # ========================
-mode = "offline"   # "offline" or "online"
+# ========================
+# STREAM OUTPUT CONFIG
+# ========================
+emit_binary_stdout = True          # write plain 0/1 to stdout (one per line)
+emit_binary_file = None            # e.g. "focus_stream.txt" to also append, or None to disable
+quiet_mode = True                  # if True, suppress verbose prints so stdout is only 0/1
+# --- NEW: score memory / auto-correlation ---
+ar_history_len = 5        # how many past scores to include
+ar_decay = 0.6            # geometric decay (0<ar_decay<1). Newer past scores weigh more.
+
+# --- NEW: dynamic thresholding over a rolling buffer of scores ---
+thr_history_len = 120    # ~ last 4 minutes if 2s hop (adjust as you like)
+thr_low_pct = 45          # enforce at least ~45% below threshold
+thr_high_pct = 55         # and ~45% above; threshold ~median-ish but guaranteed split
+thr_eps = 1e-4            # small separation in degenerate cases
+
+
+mode = "online"   # "offline" or "online"
 folder_path = r"C:\Users\hackaton\Documents\gtec\Unicorn Suite\Hybrid Black\Unicorn Recorder"
-offline_file_path = r"olddata\UnicornRawDataRecorder_03_05_2025_20_13_360.csv"  # set to a specific CSV path or leave None to use newest in folder
+offline_file_path = r"olddata\UnicornRecorder_20251005_205735.csv"  # set to a specific CSV path or leave None to use newest in folder
+# print isfile
+print(os.path.isfile(offline_file_path))
+
 image_output_path = "outputs"  # If None, will save next to CSV in offline mode
 
 fs = 250           # Sampling rate (Hz)
@@ -76,7 +97,7 @@ def _bandpower_from_psd(f, Pxx, fmin, fmax):
     idx = np.logical_and(f >= fmin, f <= fmax)
     if not np.any(idx):
         return 0.0
-    return np.trapz(Pxx[idx], f[idx])
+    return np.trapezoid(Pxx[idx], f[idx])
 
 def compute_band_powers_1ch(x, fs):
     if len(x) < int(0.5 * fs):
@@ -215,12 +236,72 @@ def save_focus_plot(time_centers, binary, out_path):
     plt.savefig(out_path, dpi=150)
     plt.close()
 
+from collections import deque
+
+class DynamicThreshold:
+    """
+    Keeps a rolling buffer of scores and returns a threshold so both classes appear.
+    We compute a percentile bracket (e.g., 45th..55th) and take the midpoint.
+    This guarantees some mass on each side as long as we have enough history.
+    """
+    def __init__(self, maxlen=600, low_pct=45, high_pct=55, eps=1e-4):
+        self.buf = deque(maxlen=maxlen)
+        self.low_pct = float(low_pct)
+        self.high_pct = float(high_pct)
+        self.eps = float(eps)
+
+    def update(self, score: float):
+        self.buf.append(float(score))
+
+    def ready(self, min_points=20):
+        return len(self.buf) >= min_points
+
+    def threshold(self, default=0.0):
+        if not self.buf:
+            return default
+        arr = np.asarray(self.buf)
+        if np.allclose(arr.min(), arr.max()):
+            # flat history: put threshold at that flat value +/- eps so both sides exist
+            return arr.mean()
+        lo = np.percentile(arr, self.low_pct)
+        hi = np.percentile(arr, self.high_pct)
+        if hi - lo < self.eps:
+            # extremely tight: nudge to ensure separation
+            mid = (lo + hi) / 2.0
+            lo = mid - self.eps
+            hi = mid + self.eps
+        return (lo + hi) / 2.0
+
+
+class ARScore:
+    """
+    Auto-correlated score = current + weighted sum of previous few scores with geometric decay.
+    Equivalent to a short AR filter; not normalized so the scale remains comparable.
+    """
+    def __init__(self, history_len=5, decay=0.6):
+        self.decay = float(decay)
+        self.hist = deque(maxlen=history_len)
+
+    def push_and_compute(self, current: float) -> float:
+        # weights: [decay^1, decay^2, ...] for hist[0] (most recent) onward
+        ar = current
+        for i, prev in enumerate(reversed(self.hist), start=1):
+            ar += (self.decay ** i) * prev
+        # update history AFTER computing (so "previous" means strictly before current)
+        self.hist.append(current)
+        return ar
+
+def label_with_threshold(score: float, thr: float) -> str:
+    return "focused" if score > thr else "unfocused"
+
 
 # ========================
 # OFFLINE MODE
 # ========================
 def run_offline():
-    file_path = offline_file_path or get_latest_csv_file(folder_path)
+    file_path = offline_file_path# or get_latest_csv_file(folder_path)
+    print(offline_file_path)
+    print(file_path)
     if not file_path:
         print("No non-raw CSV files found. Provide offline_file_path or place a CSV in the folder.")
         return [], {}
@@ -283,7 +364,10 @@ def run_offline():
     # Save plot next to CSV
     base = os.path.splitext(os.path.basename(file_path))[0]
     base = base.replace("UnicornRawDataRecorder_", "")
-    out_png = os.path.join(os.path.dirname(image_output_path), f"{base}_focus_timeseries.png")
+    # save to outputs folder
+    image_output_path = "outputs"
+    os.makedirs(image_output_path, exist_ok=True)
+    out_png = f"outputs/{base}_focus_timeseries.png"
     save_focus_plot(time_centers, binary, out_png)
 
     # Console summary
@@ -297,86 +381,144 @@ def run_offline():
 
     return binary, stats, out_png
 
-
 # ========================
 # ONLINE MODE
 # ========================
-def run_online():
-    file_path = get_latest_csv_file(folder_path)
-    if not file_path:
-        print("No non-raw CSV files found in folder. Start recording and try again.")
-        return
-    print(f"[ONLINE] Monitoring file: {file_path}")
 
-    rows_read = 0
-    seg_buffer = pd.DataFrame()
-    label_history = deque(maxlen=smooth_N)
+def _majority_vote(labels):
+    """Return 'focused' if focused votes > half, else 'unfocused'.
+    Unknowns count as unfocused in the vote."""
+    if not labels:
+        return "unknown"
+    votes = labels_to_binary(labels)  # focused=1, else 0
+    return "focused" if sum(votes) > (len(votes) / 2.0) else "unfocused"
+
+def run_online():
+    """
+    Every `online_hop_seconds`, read the newest non-raw CSV in `folder_path`,
+    take the last 500 rows (2 s), bandpass + artifact guard, classify, and print.
+    Uses a smoothing deque of length `smooth_N` for a majority-vote label.
+    """
+    print(f"[ONLINE] Watching folder: {folder_path}")
+    print(f"[ONLINE] Polling every {online_hop_seconds}s; segment size: {window_len} samples (~{window_seconds}s)\n")
+
+    smooth_q = deque(maxlen=smooth_N)
+    # NEW: managers that persist during the session
+    ar = ARScore(history_len=ar_history_len, decay=ar_decay)
+    dyn_thr = DynamicThreshold(maxlen=thr_history_len, low_pct=thr_low_pct, high_pct=thr_high_pct, eps=thr_eps)
+
+    last_file = None
 
     try:
         while True:
-            latest_file = get_latest_csv_file(folder_path)
-            if latest_file != file_path:
-                print(f"New file detected: {latest_file}")
-                file_path = latest_file
-                rows_read = 0
-                seg_buffer = pd.DataFrame()
-                label_history.clear()
+            file_path = offline_file_path
+            if not file_path:
+                print("[ONLINE] No non-raw CSV files found yet…")
+                time.sleep(online_hop_seconds)
+                continue
 
-            # Read newly appended rows (skip header = row 0)
-            df = pd.read_csv(file_path, skiprows=range(1, rows_read + 1))
+            # If a new recording starts, reset smoothing history.
+            if file_path != last_file:
+                last_file = file_path
+                smooth_q.clear()
+                print(f"[ONLINE] Now reading: {file_path}")
+
+            # Read CSV (robust to partial writes)
+            try:
+                df = pd.read_csv(file_path)
+            except Exception as e:
+                print(f"[ONLINE] Read error ({type(e).__name__}): {e}. Retrying…")
+                time.sleep(online_hop_seconds)
+                continue
+
+            # Numeric only
             df = df.apply(pd.to_numeric, errors='coerce').dropna()
+            n_total = len(df)
 
-            if df.empty:
-                time.sleep(0.5)
+            # Wait until calibration phase has enough data
+            if n_total < calibration_skip + window_len:
+                remaining = max(calibration_skip + window_len - n_total, 0)
+                print(f"[ONLINE] Waiting for calibration data: have {n_total}, need {calibration_skip + window_len} "
+                      f"(~{remaining/fs:.1f}s more).")
+                time.sleep(online_hop_seconds)
                 continue
 
-            rows_read += len(df)
+            # Tail 2s window (500 samples)
+            tail = df.tail(window_len).reset_index(drop=True)
 
-            # Skip initial calibration
-            if rows_read <= calibration_skip:
-                print(f"Skipping calibration samples ({rows_read} rows so far)...")
-                continue
-            elif rows_read - len(df) < calibration_skip:
-                df = df.iloc[(calibration_skip - (rows_read - len(df))):]
-
-            mapped_eeg_cols = [col for col in name_map.values() if col in df.columns]
+            # Only mapped EEG columns that exist
+            mapped_eeg_cols = [col for col in name_map.values() if col in tail.columns]
             if not mapped_eeg_cols:
-                time.sleep(0.5)
+                print("[ONLINE] No expected EEG channels present per name_map; will retry…")
+                time.sleep(online_hop_seconds)
                 continue
 
-            # Filter
-            for col in mapped_eeg_cols:
-                df[col] = butter_bandpass_filter(df[col].values, lowcut, highcut, fs, order)
-
+            # Bandpass filter per channel
+            try:
+                for col in mapped_eeg_cols:
+                    tail[col] = butter_bandpass_filter(tail[col].values, lowcut, highcut, fs, order)
+            except Exception as e:
+                print(f"[ONLINE] Filter error ({type(e).__name__}): {e}. Skipping this hop…")
+                time.sleep(online_hop_seconds)
+                continue
+            """
             # Artifact guard
-            valid_rows = df[(df[mapped_eeg_cols].abs() <= amplitude_limit).all(axis=1)]
-            if valid_rows.empty:
-                time.sleep(0.2)
+            clean = tail[(tail[mapped_eeg_cols].abs() <= amplitude_limit).all(axis=1)].reset_index(drop=True)
+            # If too many samples are rejected, skip this segment to avoid biased PSD
+            if len(clean) < int(0.8 * window_len):
+                print("[ONLINE] Segment too noisy (artifact guard). Skipping…")
+                time.sleep(online_hop_seconds)
                 continue
+            """
+            clean = tail
 
-            # Append to rolling buffer
-            seg_buffer = pd.concat([seg_buffer, valid_rows[mapped_eeg_cols]], axis=0)
 
-            # Process as many full windows as available with chosen hop
-            while len(seg_buffer) >= window_len:
-                window = seg_buffer.iloc[:window_len]
-                label, score, details = classify_focus(window, fs)
+            # Classify this 2s segment -> raw score
+            raw_label, raw_score, terms = classify_focus(clean[mapped_eeg_cols], fs)
 
-                label_history.append(label)
-                usable = [l for l in label_history if l != "unknown"]
-                smoothed = max(usable, key=usable.count) if usable else label
+            # Auto-correlated score (uses recent history with geometric decay)
+            s_ar = ar.push_and_compute(raw_score)
 
-                t_sec = rows_read / fs
-                print(f"[ONLINE ] t~{t_sec:8.2f}s | label={smoothed.upper()} | "
-                      f"score={score:.3f} | details={details}")
+            # Update threshold buffer and compute dynamic threshold
+            dyn_thr.update(s_ar)
+            thr = dyn_thr.threshold(default=0.0)
 
-                # Advance by hop (non-overlapping = online_hop_len == window_len; change if desired)
-                seg_buffer = seg_buffer.iloc[online_hop_len:]
+            # Thresholded label (guaranteed split given enough history)
+            dyn_label = label_with_threshold(s_ar, thr)
 
-            time.sleep(0.5)
+            # OPTIONAL: keep your majority vote smoothing, but apply it to dyn_label
+            smooth_q.append(dyn_label)
+            smoothed_label = _majority_vote(list(smooth_q))
+
+            # Rough timestamp: total seconds since recording start
+            t_seconds = n_total / fs
+
+            # Decide binary bit from the smoothed dynamic label
+            bit = 1 if smoothed_label == "focused" else 0
+
+            if not quiet_mode:
+                alpha_fcp = terms.get("alpha_fcp")
+                beta_fcp  = terms.get("beta_fcp")
+                alpha_occ = terms.get("alpha_occ")
+                def _fmt(x): 
+                    return "—" if x is None else f"{x:.3f}"
+                print(
+                    f"[t={t_seconds:7.2f}s] raw={raw_label:9s}  dyn={dyn_label:9s}  "
+                    f"smoothed={smoothed_label:9s}  raw_score={raw_score:+.3f}  "
+                    f"ar_score={s_ar:+.3f}  thr={thr:+.3f}  "
+                    f"(β_fcp={_fmt(beta_fcp)}, α_fcp={_fmt(alpha_fcp)}, α_occ={_fmt(alpha_occ)})"
+                )
+
+            # --- emit the 0/1 stream ---
+            if emit_binary_stdout:
+                print(bit, flush=True)
+
+
+
+            time.sleep(online_hop_seconds)
 
     except KeyboardInterrupt:
-        print("Stopped monitoring.")
+        print("\n[ONLINE] Stopped by user.")
 
 # ========================
 # ENTRY
